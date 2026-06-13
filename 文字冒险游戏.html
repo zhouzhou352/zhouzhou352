@@ -1000,6 +1000,7 @@
       "use strict";
 
       var STORAGE_KEY = "ai-text-adventure-state-v1";
+      var EMERGENCY_SNAPSHOT_KEY = STORAGE_KEY + ":emergency-snapshot";
       var DEFAULT_SYSTEM_PROMPT = [
         "你是一个完全由 AI 驱动的中文交互式文字冒险游戏主持人。",
         "你负责模拟整个游戏世界，包括环境、NPC、物品、线索、战斗、风险、时间流逝与剧情分支。",
@@ -1057,6 +1058,8 @@
       var activeAssistantBubble = null;
       var typeQueue = [];
       var typingTimer = null;
+      var sendClickTimes = [];
+      var suppressNextClick = false;
 
       var chat = document.getElementById("chat");
       var welcome = document.getElementById("welcome");
@@ -1103,6 +1106,7 @@
         renderMessages();
         bindEvents();
         setStatus("ready", "准备就绪");
+        restoreEmergencySnapshot();
       }
 
       function ensureStateShape() {
@@ -1276,6 +1280,28 @@
       }
 
       function bindEvents() {
+        document.addEventListener("pointerdown", function (event) {
+          if (!isPointInSendButton(event)) return;
+          var now = Date.now();
+          sendClickTimes = sendClickTimes.filter(function (time) {
+            return now - time <= 700;
+          });
+          sendClickTimes.push(now);
+          if (sendClickTimes.length >= 3) {
+            event.preventDefault();
+            event.stopPropagation();
+            suppressNextClick = true;
+            emergencySaveAndReload();
+          }
+        }, true);
+
+        document.addEventListener("click", function (event) {
+          if (!suppressNextClick) return;
+          event.preventDefault();
+          event.stopPropagation();
+          suppressNextClick = false;
+        }, true);
+
         headerToggleBtn.addEventListener("click", function () {
           var collapsed = gameHeader.classList.toggle("collapsed");
           headerToggleBtn.setAttribute("aria-label", collapsed ? "展开顶部状态栏" : "折叠顶部状态栏");
@@ -1611,6 +1637,106 @@
         showToast("已发送停止指令");
       }
 
+      function isPointInSendButton(event) {
+        if (!sendBtn) return false;
+        var rect = sendBtn.getBoundingClientRect();
+        return event.clientX >= rect.left &&
+          event.clientX <= rect.right &&
+          event.clientY >= rect.top &&
+          event.clientY <= rect.bottom;
+      }
+
+      function collectInterfaceValues() {
+        var values = {};
+        Array.prototype.slice.call(document.querySelectorAll("input[id], textarea[id], select[id]")).forEach(function (field) {
+          values[field.id] = {
+            value: field.value,
+            checked: field.checked,
+            scrollTop: field.scrollTop,
+            scrollLeft: field.scrollLeft
+          };
+        });
+        return values;
+      }
+
+      function applyInterfaceValues(values) {
+        if (!values) return;
+        Object.keys(values).forEach(function (id) {
+          var field = document.getElementById(id);
+          var data = values[id];
+          if (!field || !data) return;
+          if ("value" in data) field.value = data.value;
+          if ("checked" in data) field.checked = data.checked;
+          field.scrollTop = data.scrollTop || 0;
+          field.scrollLeft = data.scrollLeft || 0;
+        });
+        autoResizeTextarea();
+      }
+
+      function emergencySaveAndReload() {
+        flushTypeQueue(true);
+        if (state) state.messages = messages;
+        var snapshot = {
+          state: state,
+          messages: messages,
+          values: collectInterfaceValues(),
+          chatScrollTop: chat.scrollTop,
+          chatScrollLeft: chat.scrollLeft,
+          headerCollapsed: gameHeader.classList.contains("collapsed"),
+          statusClassName: statusDot.className,
+          statusText: statusText.textContent,
+          activePanelSection: getActivePanelSection(),
+          panelMobileOpen: panel.classList.contains("mobile-open")
+        };
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+          sessionStorage.setItem(EMERGENCY_SNAPSHOT_KEY, JSON.stringify(snapshot));
+        } catch (error) {
+          saveState();
+        }
+        window.location.reload();
+      }
+
+      function restoreEmergencySnapshot() {
+        var snapshot = null;
+        try {
+          snapshot = JSON.parse(sessionStorage.getItem(EMERGENCY_SNAPSHOT_KEY) || "null");
+          sessionStorage.removeItem(EMERGENCY_SNAPSHOT_KEY);
+        } catch (error) {
+          snapshot = null;
+        }
+        if (!snapshot) return;
+        if (snapshot.state) {
+          state = snapshot.state;
+          ensureStateShape();
+        }
+        if (Array.isArray(snapshot.messages)) {
+          messages = snapshot.messages;
+          state.messages = messages;
+          renderPlatformForms();
+          renderSettings();
+          renderModelSelector();
+          renderSessionSelector();
+          renderMessages();
+        }
+        applyInterfaceValues(snapshot.values);
+        gameHeader.classList.toggle("collapsed", !!snapshot.headerCollapsed);
+        headerToggleBtn.setAttribute("aria-label", snapshot.headerCollapsed ? "展开顶部状态栏" : "折叠顶部状态栏");
+        headerToggleBtn.setAttribute("aria-expanded", String(!snapshot.headerCollapsed));
+        statusDot.className = snapshot.statusClassName || "dot";
+        statusText.textContent = snapshot.statusText || "准备就绪";
+        if (snapshot.panelMobileOpen && snapshot.activePanelSection) {
+          openMobilePanel(snapshot.activePanelSection);
+        } else {
+          closeMobilePanel();
+        }
+        window.setTimeout(function () {
+          chat.scrollTop = snapshot.chatScrollTop || 0;
+          chat.scrollLeft = snapshot.chatScrollLeft || 0;
+        }, 0);
+        saveState();
+      }
+
       function appendMessage(role, content, withCursor) {
         var node = document.createElement("div");
         node.className = "message " + role;
@@ -1633,6 +1759,7 @@
 
       function setControlsGenerating(generating) {
         sendBtn.disabled = generating;
+        sendBtn.style.pointerEvents = generating ? "none" : "";
         stopBtn.disabled = !generating;
         messageInput.disabled = generating;
       }
